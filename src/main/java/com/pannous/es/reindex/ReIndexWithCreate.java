@@ -15,7 +15,6 @@ import org.elasticsearch.common.hppc.cursors.ObjectObjectCursor;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.settings.ImmutableSettings;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.rest.*;
 
 import java.io.IOException;
@@ -23,7 +22,7 @@ import java.io.IOException;
 import static org.elasticsearch.rest.RestRequest.Method.POST;
 import static org.elasticsearch.rest.RestRequest.Method.PUT;
 import static org.elasticsearch.rest.RestStatus.OK;
-import static org.elasticsearch.rest.action.support.RestXContentBuilder.restContentBuilder;
+import java.util.*;
 
 /**
  * @author Peter Karich
@@ -33,10 +32,10 @@ public class ReIndexWithCreate extends BaseRestHandler {
     private ReIndexAction reindexAction;
 
     @Inject public ReIndexWithCreate(Settings settings, Client client, RestController controller) {
-        super(settings, client);
+	super(settings, controller, client);
 
-        // Define REST endpoints to do a reindex
-        controller.registerHandler(PUT, "/_reindex", this);
+	// Define REST endpoints to do a reindex
+	controller.registerHandler(PUT, "/_reindex", this);
         controller.registerHandler(POST, "/_reindex", this);
 
         // give null controller as argument to avoid registering twice
@@ -44,38 +43,46 @@ public class ReIndexWithCreate extends BaseRestHandler {
         reindexAction = new ReIndexAction(settings, client, null);
     }
 
-    @Override public void handleRequest(RestRequest request, RestChannel channel) {
+    @Override public void handleRequest(RestRequest request, RestChannel channel, Client client) {
         logger.info("ReIndexWithCreate.handleRequest [{}]", request.toString());
         try {
-            XContentBuilder builder = restContentBuilder(request);
             // required parameters
             String newIndexName = request.param("index");
             if (newIndexName.isEmpty()) {
-                channel.sendResponse(new StringRestResponse(RestStatus.EXPECTATION_FAILED, "parameter index missing"));
+                channel.sendResponse(new BytesRestResponse(RestStatus.EXPECTATION_FAILED, "parameter index missing"));
                 return;
             }
             String type = request.param("type", "");
             if (type.isEmpty()) {
-                channel.sendResponse(new StringRestResponse(RestStatus.EXPECTATION_FAILED, "parameter type missing"));
+                channel.sendResponse(new BytesRestResponse(RestStatus.EXPECTATION_FAILED, "parameter type missing"));
                 return;
-            }
+	    }
             String searchIndexName = request.param("searchIndex");
             if (searchIndexName.isEmpty()) {
-                channel.sendResponse(new StringRestResponse(RestStatus.EXPECTATION_FAILED, "parameter searchIndex missing"));
+                channel.sendResponse(new BytesRestResponse(RestStatus.EXPECTATION_FAILED, "parameter searchIndex missing"));
                 return;
+	    }
+
+	    String skipType = request.param("skipType", "");
+	    List<String>skipTypeList;
+	    if (!skipType.isEmpty()) {
+	      skipTypeList=Arrays.asList(skipType.trim().split(","));
+	    }else{
+	      skipTypeList = new ArrayList<String>();
             }
+
             int newShards = request.paramAsInt("newIndexShards", -1);
             try {
                 if(client.admin().indices().exists(new IndicesExistsRequest(newIndexName)).actionGet().isExists()) {
                     logger.info("target index already exists, skip creation: " + newIndexName);
                 }
                 else {
-                    createIdenticalIndex(searchIndexName, type, newIndexName, newShards);
+                    createIdenticalIndex(searchIndexName, type, newIndexName, newShards, client);
                 }
             } catch (Exception ex) {
                 String str = "Problem while creating index " + newIndexName + " from " + searchIndexName + " " + ex.getMessage();
                 logger.error(str, ex);
-                channel.sendResponse(new StringRestResponse(RestStatus.INTERNAL_SERVER_ERROR, str));
+                channel.sendResponse(new BytesRestResponse(RestStatus.INTERNAL_SERVER_ERROR, str));
                 return;
             }
 
@@ -89,11 +96,15 @@ public class ReIndexWithCreate extends BaseRestHandler {
                 Settings searchIndexSettings = indexData.settings();
 
                 for(ObjectCursor<String> mapKeyCursor : indexData.mappings().keys()) {
-                    reindexAction.handleRequest(request, channel, mapKeyCursor.value, true);
+		  if (skipTypeList.contains(mapKeyCursor.value)) {
+		    logger.info("Skip type [{}]", mapKeyCursor.value);
+		    continue;
+		  }
+		  reindexAction.handleRequest(request, channel, mapKeyCursor.value, true, client);
                 }
             }
             else {
-                reindexAction.handleRequest(request, channel, type, true);
+                reindexAction.handleRequest(request, channel, type, true, client);
             }
 
             boolean delete = request.paramAsBoolean("delete", false);
@@ -114,13 +125,13 @@ public class ReIndexWithCreate extends BaseRestHandler {
 
             boolean copyAliases = request.paramAsBoolean("copyAliases", false);
             if (copyAliases)
-                copyAliases(request);
+                copyAliases(request, client);
                 
-            channel.sendResponse(new XContentRestResponse(request, OK, builder));
+            channel.sendResponse(new BytesRestResponse(OK));
                 
         } catch (Exception ex) { // also catch the RuntimeException thrown by ReIndexAction
             try {
-                channel.sendResponse(new XContentThrowableRestResponse(request, ex));
+                channel.sendResponse(new BytesRestResponse(channel, ex));
             } catch (Exception ex2) {
                 logger.error("problem while rolling index", ex2);
             }
@@ -131,7 +142,7 @@ public class ReIndexWithCreate extends BaseRestHandler {
      * Creates a new index out of the settings from the old index.
      */
     private void createIdenticalIndex(String oldIndex, String type,
-            String newIndex, int newIndexShards) throws IOException {
+            String newIndex, int newIndexShards, Client client) throws IOException {
         IndexMetaData indexData = client.admin().cluster().state(new ClusterStateRequest()).
                 actionGet().getState().metaData().indices().get(oldIndex);
         Settings searchIndexSettings = indexData.settings();
@@ -158,7 +169,7 @@ public class ReIndexWithCreate extends BaseRestHandler {
         client.admin().indices().create(createReq).actionGet();
     }
 
-    private void copyAliases(RestRequest request) {
+    private void copyAliases(RestRequest request, Client client) {
         String index = request.param("index");
         String searchIndexName = request.param("searchIndex");
         IndexMetaData meta = client.admin().cluster().state(new ClusterStateRequest()).
