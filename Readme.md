@@ -17,7 +17,7 @@ Apache License 2.0
 
 > ./reinstall.sh
 
-you should see 'loaded [reindex], sites []' in the logs. Or use the reinstall.sh script for development purposes. Be sure to use elasticsearch 1.4.0. For newer versions - please provide pull requests ;)
+you should see 'loaded [reindex], sites []' in the logs. Or use the reinstall.sh script for development purposes. Be sure to use elasticsearch 1.0.0. For newer versions - please provide pull requests ;)
 
 
 # Deinstallation
@@ -43,13 +43,6 @@ you should see 'loaded [reindex], sites []' in the logs. Or use the reinstall.sh
 
 This refeeds all documents in index 'indexold' with type 'typeold' into the index 'indexnew' with type 'typenew'.
 But only documents matching the specified filter will be refeeded. The internal Java API will be used which should be efficient.
-
-## Same cluster with create index api
-> curl -XPUT 'http://localhost:9200/_reindex?index=indexnew&type=*&searchIndex=indexold'
-
-This command creates the indexnew if not exist (the newIndexShards can be set to specify the number of shards).
-If type=* reindex all types from the index. If you want to skip some type and skipType=type1,type2
-
 
 ## Different cluster 
 
