@@ -1,5 +1,6 @@
 package com.pannous.es.reindex;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -18,9 +19,16 @@ import org.elasticsearch.common.StopWatch;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.TimeValue;
-import org.elasticsearch.rest.*;
+import org.elasticsearch.common.xcontent.XContentBuilder;
+import org.elasticsearch.rest.BaseRestHandler;
+import org.elasticsearch.rest.RestChannel;
+import org.elasticsearch.rest.RestController;
+import org.elasticsearch.rest.RestRequest;
+import org.elasticsearch.rest.XContentRestResponse;
+import org.elasticsearch.rest.XContentThrowableRestResponse;
 import static org.elasticsearch.rest.RestRequest.Method.*;
 import static org.elasticsearch.rest.RestStatus.*;
+import static org.elasticsearch.rest.action.support.RestXContentBuilder.*;
 
 /**
  * Refeeds all the documents which matches the type and the (optional) query.
@@ -30,7 +38,7 @@ import static org.elasticsearch.rest.RestStatus.*;
 public class ReIndexAction extends BaseRestHandler {
 
     @Inject public ReIndexAction(Settings settings, Client client, RestController controller) {
-        super(settings, controller, client);
+        super(settings, client);
 
         if (controller != null) {
             // Define REST endpoints to do a reindex
@@ -39,58 +47,71 @@ public class ReIndexAction extends BaseRestHandler {
         }
     }
 
-    @Override public void handleRequest(RestRequest request, RestChannel channel, Client client) {
-        handleRequest(request, channel, null, false, client);
+    @Override public void handleRequest(RestRequest request, RestChannel channel) {
+        handleRequest(request, channel, null, false);
     }
 
-    public void handleRequest(RestRequest request, RestChannel channel, String newTypeOverride, boolean internalCall, Client client) {
+    public void handleRequest(RestRequest request, RestChannel channel, String newTypeOverride, boolean internalCall) {
         logger.info("ReIndexAction.handleRequest [{}]", request.params());
-        String newIndexName = request.param("index");
-        String searchIndexName = request.param("searchIndex");
-        if (searchIndexName == null || searchIndexName.isEmpty())
-            searchIndexName = newIndexName;
+        try {
+            XContentBuilder builder = restContentBuilder(request);
+            String newIndexName = request.param("index");
+            String searchIndexName = request.param("searchIndex");
+            if (searchIndexName == null || searchIndexName.isEmpty())
+                searchIndexName = newIndexName;
 
-        String newType = newTypeOverride != null ? newTypeOverride : request.param("type");
-        String searchType = newTypeOverride != null ? newTypeOverride : request.param("searchType");
-        if (searchType == null || searchType.isEmpty())
-            searchType = newType;
+            String newType = newTypeOverride != null ? newTypeOverride : request.param("type");
+            String searchType = newTypeOverride != null ? newTypeOverride : request.param("searchType");
+            if (searchType == null || searchType.isEmpty())
+                searchType = newType;
 
-        int searchPort = request.paramAsInt("searchPort", 9200);
-        String searchHost = request.param("searchHost", "localhost");
-        boolean localAction = "localhost".equals(searchHost) && searchPort == 9200;
-        boolean withVersion = request.paramAsBoolean("withVersion", false);
-        int keepTimeInMinutes = request.paramAsInt("keepTimeInMinutes", 30);
-        int hitsPerPage = request.paramAsInt("hitsPerPage", 1000);
-        float waitInSeconds = request.paramAsFloat("waitInSeconds", 0);
-        String basicAuthCredentials = request.param("credentials", "");
-        String filter = request.content().toUtf8();
-        MySearchResponse rsp;
-        if (localAction) {
-            SearchRequestBuilder srb = createScrollSearch(searchIndexName, searchType, filter,
-                    hitsPerPage, withVersion, keepTimeInMinutes, client);
-            SearchResponse sr = srb.execute().actionGet();
-            rsp = new MySearchResponseES(client, sr, keepTimeInMinutes);
-        } else {
-            // TODO make it possible to restrict to a cluster
-            rsp = new MySearchResponseJson(searchHost, searchPort, searchIndexName, searchType, filter,
-                    basicAuthCredentials, hitsPerPage, withVersion, keepTimeInMinutes);
+            int searchPort = request.paramAsInt("searchPort", 9200);
+            String searchHost = request.param("searchHost", "localhost");
+            boolean localAction = "localhost".equals(searchHost) && searchPort == 9200;
+            boolean withVersion = request.paramAsBoolean("withVersion", false);
+            int keepTimeInMinutes = request.paramAsInt("keepTimeInMinutes", 30);
+            int hitsPerPage = request.paramAsInt("hitsPerPage", 1000);
+            float waitInSeconds = request.paramAsFloat("waitInSeconds", 0);
+            String basicAuthCredentials = request.param("credentials", "");
+            String filter = request.content().toUtf8();
+            MySearchResponse rsp;
+            if (localAction) {
+                SearchRequestBuilder srb = createScrollSearch(searchIndexName, searchType, filter,
+                        hitsPerPage, withVersion, keepTimeInMinutes);
+                SearchResponse sr = srb.execute().actionGet();
+                rsp = new MySearchResponseES(client, sr, keepTimeInMinutes);
+            } else {
+                // TODO make it possible to restrict to a cluster
+                rsp = new MySearchResponseJson(searchHost, searchPort, searchIndexName, searchType, filter,
+                        basicAuthCredentials, hitsPerPage, withVersion, keepTimeInMinutes);
+            }
+
+            // TODO make async and allow control of process from external (e.g. stopping etc)
+            // or just move stuff into a river?
+            reindex(rsp, newIndexName, newType, withVersion, waitInSeconds);
+
+            // TODO reindex again all new items => therefor we need a timestamp field to filter
+            // + how to combine with existing filter?
+
+            logger.info("Finished reindexing of index " + searchIndexName + " into " + newIndexName + ", query " + filter);
+
+            if (!internalCall)
+                channel.sendResponse(new XContentRestResponse(request, OK, builder));
+        } catch (IOException ex) {
+            if (!internalCall) {
+                try {
+                    channel.sendResponse(new XContentThrowableRestResponse(request, ex));
+                } catch (Exception ex2) {
+                    logger.error("problem while rolling index", ex2);
+                }
+            } else {
+                throw new RuntimeException(ex);
+            }
         }
-
-        // TODO make async and allow control of process from external (e.g. stopping etc)
-        // or just move stuff into a river?
-        reindex(rsp, newIndexName, newType, withVersion, waitInSeconds, client);
-
-        // TODO reindex again all new items => therefor we need a timestamp field to filter
-        // + how to combine with existing filter?
-
-        logger.info("Finished reindexing of index " + searchIndexName + " into " + newIndexName + ", query " + filter);
-
-        if (!internalCall)
-            channel.sendResponse(new BytesRestResponse(OK));
     }
 
     public SearchRequestBuilder createScrollSearch(String oldIndexName, String oldType, String filter,
-            int hitsPerPage, boolean withVersion, int keepTimeInMinutes, Client client) {
+            int hitsPerPage, boolean withVersion, int keepTimeInMinutes) {
         SearchRequestBuilder srb = client.prepareSearch(oldIndexName).
                 setTypes(oldType).
                 setVersion(withVersion).
@@ -106,7 +127,7 @@ public class ReIndexAction extends BaseRestHandler {
     }
 
     public int reindex(MySearchResponse rsp, String newIndex, String newType, boolean withVersion,
-            float waitSeconds, Client client) {
+            float waitSeconds) {
         boolean flushEnabled = false;
         long total = rsp.hits().totalHits();
         int collectedResults = 0;
@@ -129,7 +150,7 @@ public class ReIndexAction extends BaseRestHandler {
                 break;
             queryWatch.stop();
             StopWatch updateWatch = new StopWatch().start();
-            failed += bulkUpdate(res, newIndex, newType, withVersion, client).size();
+            failed += bulkUpdate(res, newIndex, newType, withVersion).size();
             if (flushEnabled)
                 client.admin().indices().flush(new FlushRequest(newIndex)).actionGet();
 
@@ -149,7 +170,7 @@ public class ReIndexAction extends BaseRestHandler {
     }
 
     Collection<Integer> bulkUpdate(MySearchHits objects, String indexName,
-            String newType, boolean withVersion, Client client) {
+            String newType, boolean withVersion) {
         BulkRequestBuilder brb = client.prepareBulk();
         for (MySearchHit hit : objects.getHits()) {
             if (hit.id() == null || hit.id().isEmpty()) {
